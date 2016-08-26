@@ -1,0 +1,256 @@
+Extending gRPC at Lyft
+GoSF
+Tags:
+
+Christopher Burnett
+Lyft, Software Engineer
+cburnett@lyft.com
+@twoism
+
+* Hi!
+
+- Core Services Eng @Lyft 
+- Formerly VSCO, and Tweet Miner
+- <3 raccoon gifs
+
+* Extending gRPC
+
+* Overview
+
+- Google Protobuf IDL extension
+- HTTP/2 transport
+- Async RPC based on Stubby
+- Just hit 1.0
+
+* The good parts
+
+- proto3 IDLs are super nice
+- multiplex and streaming with HTTP/2
+- highly extensible (with a little effort)
+
+* The not so good parts
+
+- protoc/grpc installation can be rough
+- protoc CLI is fairly complex
+- Python/PHP gRPC not as polished as Go/Java
+
+* Extension options
+
+- Hook the gRPC proto generation
+- Walk the AST and create arbitrary files
+- gRPC Interceptors
+
+* Lyft infrastructure
+
+- Go (gRPC)
+- Python (Flask/HTTP)
+- PHP Monolith (gRPC/Envoy)
+
+* Envoy
+
+- L7 edge/service proxy
+- Upgrades HTTP/1 to gRPC
+- Open source soon :)
+
+* Python
+
+- Gunicorn is a blocker
+- gRPC and GEvent incompatibility
+
+* How can we leverage IDLs anyway?
+
+- Generate flask clients/servers for python
+- Use protobufs over HTTP
+
+* What does this buy us?
+
+- Standardizes API definition and I/O
+- Enforces types at the service boundary
+- IDL is still the source of truth
+
+* IDL
+
+	syntax = "proto3";
+
+	package pb.lyft.hello;
+
+	option go_package = "hello";
+
+	service HelloWorld {
+	  rpc SayHello (SayHelloRequest) returns (SayHelloResponse) {}
+	}
+
+	message SayHelloRequest {
+	  string name = 1;
+	}
+
+	message SayHelloResponse {
+	  string hello = 1;
+	}
+
+* IDL+HTTP
+
+	syntax = "proto3";
+
+	package pb.lyft.hello_http;
+
+	option go_package = "hello_http";
+	option py_generic_services = true;
+
+	service HelloWorldHTTP {
+	    option (http_server_options).isHttpServer = true;
+
+	    rpc PostHttpHello (SayHttpHelloRequest) returns (SayHttpHelloResponse) {
+	        option (http_options).path = "/api/posthello";
+	        option (http_options).method = "post";
+	        option (http_options).impl = "test_http.handle_hello_world_post";
+	    }
+	}
+
+	message SayHttpHelloRequest {
+	    string name = 1;
+	}
+
+	message SayHttpHelloResponse {
+	    string hello = 1;
+	}
+
+* Protoc plugins
+
+* Anatomy
+
+.image plugs.png
+
+* A "simple" incantation
+
+	protoc \ 
+		--plugin=protoc-gen-example=./protoc-gen-example \
+		--example_out=plugins=protoc-gen-example=:./generated/clients \
+		-I. ./protos/hello.proto
+
+* The TL;DR of the protobuf AST
+
+* Plugin Basics
+
+	import (
+		"github.com/golang/protobuf/proto" // helper functions
+		"github.com/golang/protobuf/protoc-gen-go/generator" // the IDL processor
+	)
+
+* Unmarshal the IDL AST
+
+	g := generator.New()
+
+	data, err := ioutil.ReadAll(os.Stdin)
+	// err handling
+
+	if err := proto.Unmarshal(data, g.Request); err != nil {
+		g.Error(err, "parsing input proto")
+	}
+	g.CommandLineParameters(g.Request.GetParameter())
+
+	g.GenerateAllFiles()
+
+	data, err = proto.Marshal(g.Response)
+	// err handling
+	_, err = os.Stdout.Write(data) // pass through to the next plugin
+
+* The File Descriptor
+
+	type FileDescriptorProto struct {
+		Name           *string
+		Package        *string
+		Dependency     []string
+		MessageType    []*DescriptorProto
+		EnumType       []*EnumDescriptorProto
+		Service        []*ServiceDescriptorProto
+		Extension      []*FieldDescriptorProto
+		Options        *FileOptions // where your extensions live :)
+		SourceCodeInfo *SourceCodeInfo
+		Syntax         *string
+	}
+
+* The Service Descriptor
+
+	type ServiceDescriptorProto struct {
+		Name             *string                  
+		Method           []*MethodDescriptorProto 
+		Options          *ServiceOptions // where your extensions live :)          
+	}
+
+* The Method Descriptor
+
+	type MethodDescriptorProto struct {
+		Name 				*string
+		InputType  			*string        
+		OutputType 			*string        
+		Options    			*MethodOptions // where your extensions live :)
+		ClientStreaming 	*bool 
+		ServerStreaming  	*bool 
+	}
+
+* If we have the AST code gen is fairly easy
+
+* Python with enforced types
+
+.image clean.gif 500 _
+
+* Generated Flask server
+
+	@blueprint.route('/api/posthello', methods=['POST'])
+	def post_http_hello():
+	    from test_http import handle_hello_world_post
+	    if request.headers.get('Content-Type') == 'application/proto':
+		try:
+		    input = SayHttpHelloRequest()
+		    input.ParseFromString(request.data)
+
+		    resp = handle_hello_world_post(input)
+		    return resp.SerializeToString()
+		except Exception as e:
+		    logger.warning(
+				'Exception calling handle_hello_world_post on post_http_hello: {}'.format(repr(e))
+		    )
+		    raise e
+	    else:
+	        return handle_hello_world_post(request)
+
+* Generated Flask client
+
+	class HelloWorldHTTPClient(Client):
+	    def __init__(self):
+	        super(HelloWorldHTTPClient, self).__init__(
+	            service='test_http'
+	        )
+
+	    def post_http_hello(self, input):
+	        try:
+	            assert isinstance(input, SayHttpHelloRequest)
+		    headers = {
+		        'Content-Type': 'application/proto'
+	            }
+	            response = self.post(
+	                '/api/posthello',
+	                data=input.SerializeToString(),
+	                headers=headers,
+	                raw_request=True,
+	                raw_response=True)
+	            op = SayHttpHelloResponse()
+	            op.ParseFromString(response.content)
+	            return op
+	        except Exception as e:
+	            raise e
+
+* More info
+
+protoc-gen-example
+.link http://github.com/twoism/protoc-gen-example
+
+gRPC JSON Gateway
+.link https://github.com/grpc-ecosystem/grpc-gateway
+
+protobuf3+plugins package
+.link https://packagecloud.io/capotej/protobuf3
+
+
+
